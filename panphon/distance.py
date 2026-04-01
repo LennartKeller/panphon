@@ -1,5 +1,5 @@
 import os.path
-from functools import partial
+from functools import lru_cache, partial
 from importlib.resources import files
 from typing import Callable, Any, Dict
 
@@ -9,6 +9,62 @@ import regex as re
 import yaml
 
 from . import _panphon, featuretable, permissive, xsampa
+
+
+def _fast_unweighted_feature_edit_distance(source_vecs, target_vecs):
+    """Compute unweighted feature edit distance using numpy arrays.
+
+    Optimized version that avoids per-cell Python function call overhead.
+
+    Args:
+        source_vecs: list of feature vectors (lists of ints) for source
+        target_vecs: list of feature vectors (lists of ints) for target
+
+    Returns:
+        float: unweighted feature edit distance
+    """
+    n, m = len(source_vecs), len(target_vecs)
+    if n == 0:
+        return sum(_indel_cost_vec(v) for v in target_vecs)
+    if m == 0:
+        return sum(_indel_cost_vec(v) for v in source_vecs)
+
+    # Convert to numpy arrays for vectorized sub cost
+    src = np.array(source_vecs, dtype=np.int8)
+    tgt = np.array(target_vecs, dtype=np.int8)
+    num_features = src.shape[1]
+
+    # Precompute indel costs: (count of 0s * 0.5 + count of non-0s) / num_features
+    src_indel = np.where(src == 0, 0.5, 1.0).sum(axis=1) / num_features
+    tgt_indel = np.where(tgt == 0, 0.5, 1.0).sum(axis=1) / num_features
+
+    # DP with two rows
+    prev = np.zeros(m + 1)
+    for j in range(1, m + 1):
+        prev[j] = prev[j - 1] + tgt_indel[j - 1]
+
+    curr = np.empty(m + 1)
+    for i in range(1, n + 1):
+        curr[0] = prev[0] + src_indel[i - 1]
+        # Vectorized substitution cost for row i against all targets
+        # sub_costs[j] = sum(|src[i-1] - tgt[j]|) / 2 / num_features
+        diffs = np.abs(src[i - 1] - tgt)  # shape (m, num_features)
+        sub_costs = diffs.sum(axis=1) / (2.0 * num_features)
+
+        for j in range(1, m + 1):
+            curr[j] = min(
+                prev[j] + src_indel[i - 1],      # deletion
+                prev[j - 1] + sub_costs[j - 1],   # substitution
+                curr[j - 1] + tgt_indel[j - 1],   # insertion
+            )
+        prev, curr = curr, prev
+
+    return float(prev[m])
+
+
+def _indel_cost_vec(v):
+    """Indel cost for a single feature vector."""
+    return sum(0.5 if x == 0 else 1 for x in v) / len(v)
 
 
 def zerodiviszero(f: Callable) -> Callable:
@@ -353,12 +409,9 @@ class Distance(object):
                    costs set so insdel operations cost as much, roughly, as
                    substituting a whole segment
         """
-        return self.min_edit_distance(self.unweighted_deletion_cost,
-                                      self.unweighted_insertion_cost,
-                                      self.unweighted_substitution_cost,
-                                      [[]],
-                                      self.fm.word_to_vector_list(source, numeric=True),
-                                      self.fm.word_to_vector_list(target, numeric=True))
+        return _fast_unweighted_feature_edit_distance(
+            self.fm.word_to_vector_list(source, numeric=True),
+            self.fm.word_to_vector_list(target, numeric=True))
 
     @xsampaopt
     def jt_feature_edit_distance(self, source, target, xsampa=False):
@@ -459,7 +512,7 @@ class Distance(object):
 
     def feature_error_rate(self, hyp, ref, xsampa=False):
         """Feature error rate over lists of hypothesized and reference strings.
-        
+
         Args:
             hyp (list[str]): hypothesized strings
             ref (list[str]): reference strings
@@ -470,8 +523,7 @@ class Distance(object):
         """
         if hyp and ref:
             errors = sum([self.feature_edit_distance(h, r) for (h, r) in zip(hyp, ref)])
-            ft = featuretable.FeatureTable()
-            total_phones = sum([len(ft.ipa_segs(r)) for r in ref])
+            total_phones = sum([len(self.fm.ipa_segs(r)) for r in ref])
             return errors / total_phones
         else:
             return 0.0

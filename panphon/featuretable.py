@@ -3,7 +3,7 @@
 import collections
 import os.path
 import unicodedata
-from functools import reduce
+from functools import lru_cache, reduce
 from importlib.resources import files
 from typing import Any, List, Dict, Tuple
 
@@ -69,6 +69,7 @@ class FeatureTable(object):
         self.xsampa = xsampa.XSampa()
 
         self.sorted_segments = SegmentSorter(self.segments) # used for quick binary searches
+        self._wtvl_cache = {}  # cache for word_to_vector_list
 
     @staticmethod
     def normalize(data: str) -> str:
@@ -518,12 +519,20 @@ class FeatureTable(object):
             word = self.xsampa.convert(word)
         if nonstandard_tones:
             word=self.standardize_tones(word,nonstandard_tones)
+
+        # Use cache for the common case (no xsampa conversion already applied)
+        cache_key = (word, numeric, normalize)
+        if cache_key in self._wtvl_cache:
+            return self._wtvl_cache[cache_key]
+
         segs = self.word_fts(word, normalize or xsampa)
 
         if numeric:
             tensor = [x.numeric() for x in segs]
         else:
             tensor = [x.strings() for x in segs]
+
+        self._wtvl_cache[cache_key] = tensor
         return tensor
 
     def _compare_vectors(self,vector1, vector2):
